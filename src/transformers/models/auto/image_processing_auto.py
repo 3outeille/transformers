@@ -229,6 +229,7 @@ else:
             ("vit_msn", ("ViTImageProcessor", "ViTImageProcessorFast")),
             ("vitmatte", ("VitMatteImageProcessor", "VitMatteImageProcessorFast")),
             ("vitpose", ("VitPoseImageProcessor", "VitPoseImageProcessorFast")),
+            ("vivit", ("VivitImageProcessor", None)),
             ("xclip", ("CLIPImageProcessor", "CLIPImageProcessorFast")),
             ("yolos", ("YolosImageProcessor", "YolosImageProcessorFast")),
             ("zoedepth", ("ZoeDepthImageProcessor", "ZoeDepthImageProcessorFast")),

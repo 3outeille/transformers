@@ -40,6 +40,22 @@ class OlmoeConfig(PreTrainedConfig):
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"num_local_experts": "num_experts"}
 
+    # Default tensor parallel plan for base model `Olmoe`
+    # Note: q_norm and k_norm use "colwise" (not "replicated_with_grad_allreduce") because
+    # OLMoE applies these norms after the q/k projections, so the norm weight dimensions
+    # must match the sharded projection output.
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.self_attn.q_norm": "colwise",
+        "layers.*.self_attn.k_norm": "colwise",
+        "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
+        "layers.*.mlp.experts.down_proj": "rowwise",
+        "layers.*.mlp.experts": "moe_tp_experts",
+    }
+
     def __init__(
         self,
         vocab_size: int | None = 50304,

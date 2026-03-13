@@ -172,6 +172,10 @@ class OlmoeModelTester:
         return config, inputs_dict
 
 
+if is_torch_available():
+    OlmoeModelTester.causal_lm_class = OlmoeForCausalLM
+
+
 @require_torch
 class OlmoeModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, TensorParallelTesterMixin, unittest.TestCase):
     all_model_classes = (OlmoeModel, OlmoeForCausalLM) if is_torch_available() else ()

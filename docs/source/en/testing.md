@@ -216,6 +216,16 @@ pytest --doctest-modules <path_to_file_or_dir>
 
 If the file has a markdown extension, you should add the `--doctest-glob="*.md"` argument.
 
+### Run runnable code blocks
+
+When `hf-doc-builder` is installed, you can point pytest directly at a Markdown page that uses `doc-builder` runnable Python fences:
+
+```bash
+pytest -q docs/source/en/my_page.md
+```
+
+This auto-loads the `doc-builder` pytest plugin and executes fenced `py`/`python` blocks marked with `runnable` or `runnable:<label>`. For the full syntax, including continuation blocks and `# pytest-decorator:` directives, see the [`doc-builder` runnable code blocks guide](https://github.com/huggingface/doc-builder/blob/main/README.md#runnable-code-blocks).
+
 ### Run only modified tests
 
 You can run the tests related to the unstaged files or the current branch (according to Git) by using [pytest-picked](https://github.com/anapaulagomes/pytest-picked). This is a great way of quickly testing your changes didn't break

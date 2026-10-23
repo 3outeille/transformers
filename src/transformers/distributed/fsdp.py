@@ -188,12 +188,17 @@ def verify_fsdp_plan(module_names: list[str], fsdp_plan: dict[str, str] | None) 
 def apply_fully_sharded_data_parallelism(model: nn.Module, mesh_manager: MeshManager) -> nn.Module:
     """
     Apply FSDP2 (fully_shard) to a model: dispatched experts on `efsdp` and the rest of the modules on `fsdp`.
+    With `dp_replicate_size > 1`, the modules are sharded on the 2-D `(dp_replicate, fsdp)` mesh instead, which FSDP2
+    treats as HSDP.
 
     Torch availability, distributed initialization and the version requirement
     are asserted upstream by `initialize_distributed_mesh`.
     """
     distributed_config = model.config.distributed_config
-    fsdp_mesh = mesh_manager.get_mesh("fsdp")
+    if distributed_config.dp_replicate_size > 1:
+        fsdp_mesh = mesh_manager.get_mesh(("dp_replicate", "fsdp"))
+    else:
+        fsdp_mesh = mesh_manager.get_mesh("fsdp")
     fsdp_plan = dict(getattr(model, "_fsdp_plan", None) or {})
     if not fsdp_plan:
         raise ValueError(

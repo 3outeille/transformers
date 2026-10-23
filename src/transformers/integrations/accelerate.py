@@ -93,7 +93,9 @@ def get_module_size_with_ties(
     return module_size_with_ties, tied_module_names, tied_modules
 
 
-def check_and_set_device_map(device_map: "torch.device | int | str | dict | None") -> dict | str | None:
+def check_and_set_device_map(
+    device_map: "torch.device | int | str | dict | None", requires_accelerate: bool = True
+) -> dict | str | None:
     from ..modeling_utils import get_torch_context_manager_or_global_device
 
     # Potentially detect context manager or global device, and use it (only if no device_map was provided)
@@ -133,7 +135,7 @@ def check_and_set_device_map(device_map: "torch.device | int | str | dict | None
     if device_map is not None:
         if is_deepspeed_zero3_enabled():
             raise ValueError("DeepSpeed Zero-3 is not compatible with passing a `device_map`.")
-        if not is_accelerate_available():
+        if requires_accelerate and not is_accelerate_available():
             raise ValueError(
                 "Using a `device_map`, `tp_plan`, `torch.device` context manager or setting `torch.set_default_device(device)` "
                 "requires `accelerate`. You can install it with `pip install accelerate`"

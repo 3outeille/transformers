@@ -4162,6 +4162,7 @@ class PreTrainedModel(
             # For backwards compatibility, we still support passing `tp_plan` and `tp_size` directly to `from_pretrained`.
             distributed_config = DistributedConfig(tp_plan=tp_plan, tp_size=tp_size)
 
+        mesh_manager = None
         if distributed_config is not None:
             distributed_config, device_map, mesh_manager = cls.prepare_distribute_model(
                 distributed_config, device_map=device_map
@@ -4191,7 +4192,8 @@ class PreTrainedModel(
                 cache_dir=cache_dir,
             )
             download_kwargs["revision"] = revision
-        device_map = check_and_set_device_map(device_map)  # warn, error and fix the device map
+        # The device map set up by `distributed_config` is this rank's device: loading onto it doesn't need accelerate.
+        device_map = check_and_set_device_map(device_map, requires_accelerate=mesh_manager is None)
 
         user_agent = {"file_type": "model", "framework": "pytorch", "from_auto_class": from_auto_class}
         if from_pipeline is not None:

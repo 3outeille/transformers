@@ -1401,6 +1401,15 @@ class ModelUtilsTest(TestCasePlus):
             # This check we did call the fake head request
             mock_head.assert_called()
 
+    def test_distributed_device_map_does_not_require_accelerate(self):
+        from transformers.integrations.accelerate import check_and_set_device_map
+
+        device = torch.device("cpu")
+        with patch("transformers.integrations.accelerate.is_accelerate_available", return_value=False):
+            with self.assertRaisesRegex(ValueError, "requires `accelerate`"):
+                check_and_set_device_map(device)
+            self.assertEqual(check_and_set_device_map(device, requires_accelerate=False), {"": device})
+
     @require_accelerate
     @mark.accelerate_tests
     def test_save_model_with_device_map_cpu(self):

@@ -101,8 +101,8 @@ class PipelineStage:
         # Wait for the communication to complete.
         for req in dist.batch_isend_irecv([op]):
             req.wait()
-        if comm_device.type == "cuda":
-            torch.cuda.synchronize()
+        if comm_device.type != "cpu":
+            torch.accelerator.synchronize(comm_device)
 
         return None if is_send else tensor.to(device=device, dtype=dtype)
 

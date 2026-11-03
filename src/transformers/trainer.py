@@ -796,8 +796,8 @@ class Trainer:
             dynamo_plugin = TorchDynamoPlugin(
                 backend=self.args.torch_compile_backend,
                 mode=self.args.torch_compile_mode,
-                # The Neuron backend fails to compile graphs with dynamic shapes
-                dynamic=False if self.args.torch_compile_backend == "neuron" else None,
+                # The Neuron and TPU backends compile with static shapes (same as `_default_compile_config`)
+                dynamic=False if self.args.torch_compile_backend in ("neuron", "tpu") else None,
             )
             args["dynamo_plugin"] = dynamo_plugin
 

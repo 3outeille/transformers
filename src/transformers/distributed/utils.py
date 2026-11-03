@@ -90,6 +90,10 @@ DISTRIBUTED_BACKEND_MAP = {
     "tpu": "tpu_dist",
 }
 
+# Backends that get `device_id` in `init_process_group`. A bound device makes DeviceMesh (torch>=2.12)
+# create its subgroups with `split_group`, so only list backends that support splitting.
+BACKENDS_WITH_DEVICE_ID = {"nccl"}
+
 
 def get_distributed_backend(device_type: str) -> str | None:
     """Return the `torch.distributed` backend for `device_type`, or `None` if it has no dedicated one."""
@@ -128,20 +132,13 @@ def _ensure_torch_distributed(device_type: str | None = None):
             world_size = int(os.environ["WORLD_SIZE"])
 
             backend = get_distributed_backend(device_type)
-
-            # Bind the accelerator before init so the process group is created with a
-            # device_id, otherwise collectives like barrier() warn (and may spin up an
-            # extra NCCL comm) about the missing device binding.
+            # Bind before init so collectives run on this rank's device.
             device = _bind_local_device(device_type, local_rank)
-            # Only pass device_id to backends that support communicator splitting, for now we limit
-            # it to NCCL: a bound device makes DeviceMesh create its subgroups with `split_group`,
-            # which fails on backends without split support (e.g. Neuron).
-            device_id = device if backend == "nccl" else None
             torch.distributed.init_process_group(
                 backend=backend,
                 rank=rank,
                 world_size=world_size,
-                device_id=device_id,
+                device_id=device if backend in BACKENDS_WITH_DEVICE_ID else None,
                 # Sharded loading takes tens of minutes with high rank skew; the default 10-minute watchdog is too short
                 timeout=timedelta(hours=2),
             )

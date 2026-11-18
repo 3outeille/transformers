@@ -1267,14 +1267,12 @@ class WeightConverter(WeightTransform):
         # attribute during the whole process
         collected_tensors = self.materialize_tensors()
 
-        # Uneven sharding can leave this rank no rows at all. There is nothing for the operations to
-        # merge or permute, and `torch.stack([])` would raise, so pass the targets straight through:
-        # the parameter is not missing, and `set_param_for_module` marks it loaded.
-        empty_shard = any(len(tensors) == 0 for tensors in collected_tensors.values())
-        if empty_shard:
-            collected_tensors = {target: torch.empty(0) for target in self.target_patterns}
+        # Uneven sharding can leave this rank nothing to convert: skip the ops, `set_param_for_module` loads the empty shard
+        operations = self.operations
+        if not any(collected_tensors.values()):
+            collected_tensors, operations = dict.fromkeys(self.target_patterns, torch.empty(0)), []
 
-        for op in [] if empty_shard else self.operations:
+        for op in operations:
             with log_conversion_errors(layer_name, loading_info, (len(collected_tensors), layer_name), op):
                 collected_tensors = op.convert(
                     collected_tensors,
@@ -1447,10 +1445,8 @@ def set_param_for_module(
 
     ref = getattr(module_obj, param_name)
     if is_dtensor(ref) and ref._local_tensor.numel() == 0:
-        # Uneven sharding left this rank an empty local shard, possibly still on the meta device. Load an empty
-        # tensor of its shape so that it is materialized and counts as loaded: otherwise `_init_weights`
-        # re-initializes it, and the first DTensor RNG op is a collective the fully loaded ranks never join.
-        param_value = torch.empty(ref._local_tensor.shape, dtype=ref.dtype, device=ref.device_mesh.device_type)
+        # Empty shard from uneven sharding: mark it loaded, or `_init_weights` runs a collective the other ranks skip
+        param_value = torch.empty_like(ref._local_tensor, device=ref.device_mesh.device_type)
 
     if ref is None:
         loading_info.unexpected_keys.add(target_name)

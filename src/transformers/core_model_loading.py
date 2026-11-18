@@ -1267,7 +1267,12 @@ class WeightConverter(WeightTransform):
         # attribute during the whole process
         collected_tensors = self.materialize_tensors()
 
-        for op in self.operations:
+        # Uneven sharding can leave this rank nothing to convert: skip the ops, `set_param_for_module` loads the empty shard
+        operations = self.operations
+        if not any(collected_tensors.values()):
+            collected_tensors, operations = dict.fromkeys(self.target_patterns, torch.empty(0)), []
+
+        for op in operations:
             with log_conversion_errors(layer_name, loading_info, (len(collected_tensors), layer_name), op):
                 collected_tensors = op.convert(
                     collected_tensors,
@@ -1439,6 +1444,10 @@ def set_param_for_module(
         return
 
     ref = getattr(module_obj, param_name)
+    if is_dtensor(ref) and ref._local_tensor.numel() == 0:
+        # Empty shard from uneven sharding: mark it loaded, or `_init_weights` runs a collective the other ranks skip
+        param_value = torch.empty_like(ref._local_tensor, device=ref.device_mesh.device_type)
+
     if ref is None:
         loading_info.unexpected_keys.add(target_name)
     else:

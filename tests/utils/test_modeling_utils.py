@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import copy
 import glob
 import json
@@ -26,6 +27,7 @@ import unittest
 import unittest.mock as mock
 import uuid
 import warnings
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
@@ -4367,6 +4369,97 @@ class GradientCheckpointingDeprecatedAliasTest(unittest.TestCase):
             model.activation_checkpointing_enable({"use_reentrant": False}, every_n_layers=2)
         self.assertEqual(received_kwargs, [{"use_reentrant": False}])
         self.assertEqual([layer.gradient_checkpointing for layer in model.layers], [True, False])
+
+
+class GradientCheckpointingCompileTest(unittest.TestCase):
+    """`activation_checkpointing_enable(compile_layers=True)`: the checkpoint around a compiled layer body."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _compiled_with_aot_eager():
+        """`torch.compile` with a backend that needs no C++ toolchain: what these tests check is the wiring (one
+        compiled body per layer, the checkpoint outside it, the same graph for the recompute), not inductor's speed."""
+        original = torch.compile
+        with patch.object(torch, "compile", partial(original, backend="aot_eager")):
+            yield
+
+    def _model(self):
+        from transformers import LlamaModel, set_seed
+
+        config = LlamaConfig(
+            num_hidden_layers=2,
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=128,
+        )
+        set_seed(0)
+        return LlamaModel(config).train()
+
+    def _backward(self, model, input_ids):
+        model(input_ids=input_ids).last_hidden_state.float().pow(2).mean().backward()
+        return [p.grad.clone() for p in model.parameters()]
+
+    def test_gradients_match_the_uncompiled_run(self):
+        model = self._model()
+        input_ids = torch.randint(0, 128, (1, 16))
+
+        expected = self._backward(model, input_ids)
+
+        model.zero_grad(set_to_none=True)
+        with self._compiled_with_aot_eager():
+            model.activation_checkpointing_enable(compile_layers=True)
+            actual = self._backward(model, input_ids)
+
+        for expected_grad, grad in zip(expected, actual):
+            torch.testing.assert_close(grad, expected_grad)
+
+    def test_each_layer_gets_its_own_compiled_body(self):
+        model = self._model()
+        with self._compiled_with_aot_eager():
+            model.activation_checkpointing_enable(compile_layers=True)
+            self._backward(model, torch.randint(0, 128, (1, 16)))
+
+        bodies = [layer._compiled_body for layer in model.layers]
+        self.assertTrue(all(body is not None for body in bodies))
+        # one graph per layer: a shared body recompiles per layer until dynamo's `recompile_limit` drops the rest
+        self.assertNotEqual(id(bodies[0]), id(bodies[1]))
+
+    def test_the_checkpoint_stays_outside_the_compiled_body(self):
+        model = self._model()
+        with self._compiled_with_aot_eager():
+            model.activation_checkpointing_enable(compile_layers=True)
+            self._backward(model, torch.randint(0, 128, (1, 16)))
+
+        layer = model.layers[0]
+        # the compiled body is the layer's own forward, and it is what the checkpoint calls
+        self.assertTrue(layer._compile_layer_body)
+        self.assertFalse(isinstance(layer._compiled_body, torch.nn.Module))
+        self.assertTrue(layer._gradient_checkpointing_func.keywords["use_reentrant"])
+
+    def test_a_non_reentrant_checkpoint_is_refused(self):
+        model = self._model()
+        with self.assertRaisesRegex(ValueError, "use_reentrant"):
+            model.activation_checkpointing_enable(
+                activation_checkpointing_kwargs={"use_reentrant": False}, compile_layers=True
+            )
+
+    def test_disable_clears_the_flag(self):
+        model = self._model()
+        model.activation_checkpointing_enable(compile_layers=True)
+        model.activation_checkpointing_disable()
+        self.assertFalse(any(layer._compile_layer_body for layer in model.layers))
+
+    def test_off_by_default(self):
+        """Without `compile_layers` nothing changes: the default checkpoint function, and no compiled body."""
+        model = self._model()
+        model.activation_checkpointing_enable()
+        self.assertFalse(any(layer._compile_layer_body for layer in model.layers))
+        self._backward(model, torch.randint(0, 128, (1, 16)))
+        for layer in model.layers:
+            self.assertFalse(layer._gradient_checkpointing_func.keywords["use_reentrant"])
+            self.assertIsNone(layer.__dict__.get("_compiled_body"))
 
 
 @require_torch_accelerator

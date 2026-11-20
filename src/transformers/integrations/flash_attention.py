@@ -1,6 +1,10 @@
 import torch
 
-from ..modeling_flash_attention_utils import _flash_attention_forward, flash_attn_supports_top_left_mask
+from ..modeling_flash_attention_utils import (
+    _flash_attention_forward,
+    flash_attn_supports_top_left_mask,
+    flash_attn_supports_value_head_dim,
+)
 from ..utils import logging
 
 
@@ -59,9 +63,11 @@ def flash_attention_forward(
     value = value.transpose(1, 2)
 
     # FlashAttention requires the query and value to share a head dim; pad `value` up to the
-    # query head dim (e.g. MLA, where `v_head_dim < qk_head_dim`) and crop the output below.
+    # query head dim (e.g. MLA, where `v_head_dim < qk_head_dim`) and crop the output below. flash-attn4 is the
+    # exception: its kernels take the value at its own width, and reject the padded pair.
+    implementation = module.config._attn_implementation  # type: ignore <- the config is cached on the module
     head_dim, v_head_dim = query.shape[-1], value.shape[-1]
-    if v_head_dim != head_dim:
+    if v_head_dim != head_dim and not flash_attn_supports_value_head_dim(implementation):
         value = torch.nn.functional.pad(value, [0, head_dim - v_head_dim])
 
     # In PEFT, usually we cast the layer norms in float32 for training stability reasons
@@ -87,7 +93,7 @@ def flash_attention_forward(
         softcap=softcap,
         use_top_left_mask=_use_top_left_mask,
         target_dtype=target_dtype,
-        attn_implementation=module.config._attn_implementation,  # type: ignore <- the config is cached on the module
+        attn_implementation=implementation,
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
         s_aux=(s_aux.to(query.dtype) if s_aux is not None else None),  # FA only accepts half precision
         **kwargs,

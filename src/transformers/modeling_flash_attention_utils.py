@@ -79,7 +79,8 @@ FLASH_ATTN_KERNEL_VERSIONS = {
     "kernels-community/flash-attn3": 1,
     "kernels-community/vllm-flash-attn3": 1,
     "kernels-community/aiter-flash-attn": 2,
-    "kernels-community/flash-attn4": 0,
+    # v0 calls `cutlass.cute.ThrMma`, which nvidia-cutlass-dsl 4.4.0 removed, so v0 no longer imports.
+    "kernels-community/flash-attn4": 1,
     "kernels-community/metal-flash-sdpa": 2,
 }
 
@@ -92,6 +93,11 @@ FLASH_ATTN_KERNEL_DEVICES = {
     "kernels-community/flash-attn4": ("cuda",),
     "kernels-community/metal-flash-sdpa": ("mps",),
 }
+
+# flash-attn4's CUTE-DSL kernels differ from the other flash kernels in two ways that the wrapper has to know about:
+# their host side rejects 0-dim `max_seqlen_*`, and they take the value at its own head width.
+FLASH_ATTN4 = ("flash_attention_4", "kernels-community/flash-attn4")
+
 
 # Meta information on each mainline FA compatibility:
 #   1. The import structure and availability
@@ -246,7 +252,7 @@ def _lazy_imports(
     return flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache, pad_input, unpad_input
 
 
-def _lazy_define_process_function(flash_function):
+def _lazy_define_process_function(flash_function, implementation: str | None = None):
     """
     Depending on the version and kernel some features are not supported. Due to limitations in
     `torch.compile`, we opt to statically type which (optional) kwarg parameters are supported
@@ -267,7 +273,11 @@ def _lazy_define_process_function(flash_function):
         if (fa_alternative_name := _flash_api_alternative_names.get(param, param)) != fa_param:
             supports_mapping[fa_alternative_name] = fa_alternative_name in flash_parameters
 
-    return partial(_process_flash_attention_kwargs, supports_mapping=supports_mapping)
+    return partial(
+        _process_flash_attention_kwargs,
+        supports_mapping=supports_mapping,
+        int_max_seqlen=flash_attn_requires_int_max_seqlen(implementation),
+    )
 
 
 def lazy_import_flash_attention(
@@ -299,11 +309,13 @@ def lazy_import_flash_attention(
         # Some kernels, like the MSA kernel from minimax, have no varlen function. In this case, the varlen path
         # can never be used, so no need to build a processing function for it, just return a dict builder.
         _process_flash_kwargs_fn = (
-            _lazy_define_process_function(_flash_varlen_fn) if _flash_varlen_fn is not None else dict
+            _lazy_define_process_function(_flash_varlen_fn, implementation) if _flash_varlen_fn is not None else dict
         )
         # Similarly, some kernels don't have a kvcache function
         _process_with_kvcache_kwargs_fn = (
-            _lazy_define_process_function(_flash_with_kvcache_fn) if _flash_with_kvcache_fn is not None else dict
+            _lazy_define_process_function(_flash_with_kvcache_fn, implementation)
+            if _flash_with_kvcache_fn is not None
+            else dict
         )
 
     return (
@@ -598,6 +610,28 @@ def fa_peft_integration_check(
     return q, k, v
 
 
+def _is_flash_attn4(implementation: str | None) -> bool:
+    """Whether `implementation` is flash-attn4, by name or by hub repo id (`repo`, `repo@rev`, `repo:function`)."""
+    return implementation is not None and implementation.split("@")[0].split(":")[0] in FLASH_ATTN4
+
+
+def flash_attn_supports_value_head_dim(implementation: str | None) -> bool:
+    """Whether `implementation` takes the value at its own head width, e.g. MLA's `(192, 128)`, instead of the query's.
+
+    flash-attn4's SM100/SM110 kernels accept `(192, 128)` "for DeepSeek" and reject the `(192, 192)` that padding the
+    value up to the query width would produce.
+    """
+    return _is_flash_attn4(implementation)
+
+
+def flash_attn_requires_int_max_seqlen(implementation: str | None) -> bool:
+    """Whether `implementation` rejects a 0-dim tensor for `max_seqlen_q`/`max_seqlen_k`.
+
+    flash-attn4's host side compiles per call and checks the argument types, so it needs Python ints.
+    """
+    return _is_flash_attn4(implementation)
+
+
 class FlashAttentionKwargs(TypedDict, total=False):
     """
     Keyword arguments for Flash Attention with Compile.
@@ -633,6 +667,7 @@ def _process_flash_attention_kwargs(
     max_seqlen_q: int | torch.IntTensor | None = None,
     max_seqlen_k: int | torch.IntTensor | None = None,
     supports_mapping: dict[str, bool] | None = None,
+    int_max_seqlen: bool = False,
     block_table: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
     **kwargs,
@@ -672,6 +707,8 @@ def _process_flash_attention_kwargs(
             The block table used by paged flash attention to know where to read and write the KV cache.
         cache_seqlens (`torch.Tensor`, *optional*):
             The number of cache tokens per sequence. Used by paged flash to know how much KV cache to read and write.
+        int_max_seqlen (`bool`, *optional*):
+            Whether the kernel needs `max_seqlen_q`/`max_seqlen_k` as Python ints, which flash-attn4 does.
     Return:
         flash_kwargs (`dict`):
             A dict of kwargs that are requested and supported.
@@ -719,24 +756,21 @@ def _process_flash_attention_kwargs(
     if supports_mapping["cache_seqlens"] and cache_seqlens is not None:
         flash_kwargs["cache_seqlens"] = cache_seqlens
 
-    # There is a limitation of the flash attention API, as the function `flash_attn_varlen_func`
-    # may require `max_length_q`, `max_length_k` to be passed as `int` and not `torch.Tensor`.
-    #
-    # You can either set
-    #   - Env: `TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1`
-    #   - Before compiling: `torch._dynamo.config.capture_scalar_outputs = True`
-    # to allow torch compile to handle scalar outputs in those cases.
+    # `flash_attn_varlen_func` wants `max_length_q`, `max_length_k` as `int`, not as `torch.Tensor`. flash-attn4
+    # enforces it (`ARG_ANNOTATION_MISMATCH: expects argument #26 (max_seqlen_q) to be int`), so its callers pay one
+    # device sync per layer; for the other kernels the tensor is passed through, as before. Under `torch.compile`
+    # the conversion needs `TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1` (or `torch._dynamo.config.capture_scalar_outputs`).
     same_max_seqlen = max_seqlen_q is max_seqlen_k  # to avoid 2x device syncs
     if supports_mapping["max_seqlen_q"] and max_seqlen_q is not None:
-        if not isinstance(max_seqlen_q, int) and is_tracing(max_seqlen_q):
-            max_seqlen_q = max_seqlen_q.item()
+        if int_max_seqlen or is_tracing(max_seqlen_q):
+            max_seqlen_q = int(max_seqlen_q)
         flash_kwargs["max_seqlen_q"] = max_seqlen_q
 
     if supports_mapping["max_seqlen_k"] and max_seqlen_k is not None:
         if same_max_seqlen and flash_kwargs["max_seqlen_q"] is not None:
             max_seqlen_k = flash_kwargs["max_seqlen_q"]
-        elif not isinstance(max_seqlen_k, int) and is_tracing(max_seqlen_k):
-            max_seqlen_k = max_seqlen_k.item()
+        elif int_max_seqlen or is_tracing(max_seqlen_k):
+            max_seqlen_k = int(max_seqlen_k)
         flash_kwargs["max_seqlen_k"] = max_seqlen_k
 
     return flash_kwargs
@@ -832,6 +866,13 @@ def _flash_attention_forward(
         out = flash_kvcache_fn(q, k_cache, v_cache, k, v, **flash_kwargs)
         out = out[0] if isinstance(out, tuple) else out
         return out.view(batch_size, -1, *out.shape[-2:])
+
+    # A dense 4-D mask on a packed row is the same statement as the packed lengths: one causal block per document.
+    # Keeping it would take the padding branch below, which reads it as a 2-D padding mask and builds a wrong
+    # `cu_seqlens` (flash-attn4: `cu_seqlens_k must have shape (batch_size + 1,)`).
+    if attention_mask is not None and attention_mask.dim() == 4:
+        if is_fa_with_varlen_kwargs or _is_packed_sequence(position_ids, batch_size):
+            attention_mask = None
 
     # Contains at least one padding token in the sequence: unpad compute cu_seqlen and max_length from attention mask
     if attention_mask is not None:

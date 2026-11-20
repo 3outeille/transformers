@@ -25,12 +25,15 @@ from transformers.distributed.expert_parallel import (
     AllReduceEP,
     AllToAllEP,
     AutoEP,
+    DeepEP,
     EpDispatchExpertsParallel,
     EPImplementation,
     EPImplementationInterface,
+    deep_ep_local_expert_ids,
+    deep_ep_routing,
 )
 from transformers.distributed.parallel_utils import ALL_PARALLEL_STYLES
-from transformers.testing_utils import TestCasePlus, is_expert_parallel_test
+from transformers.testing_utils import TestCasePlus, is_expert_parallel_test, require_torch
 
 from ..distributed_testing_utils import run_distributed
 
@@ -108,6 +111,10 @@ class TestExpertParallelLayer(TestCasePlus):
     def test_auto_ep_picks_all_reduce_only_at_inference_on_a_shared_batch(self):
         run_distributed(world_size=2, backend="gloo")(_auto_ep_picks_all_reduce_only_at_inference_on_a_shared_batch)()
 
+    def test_the_install_path_refuses_it_without_the_package(self):
+        """The user-facing path: `ep_implementation="deep_ep"` without the package raises the install message."""
+        run_distributed(world_size=2, backend="gloo")(_deep_ep_without_the_package_is_refused)()
+
     def test_install_forward_checks_ep_implementation(self):
         """An unknown name and `"all_reduce"` without a shared batch are refused; a registered implementation runs."""
         run_distributed(world_size=2, backend="gloo")(_install_forward_checks_ep_implementation)()
@@ -135,6 +142,67 @@ class TestExpertParallelLayer(TestCasePlus):
             model._resolve_parallel_plans(DistributedConfig(tp_size=2, ep_size=2, ep_plan={module: style}))
 
 
+@require_torch
+class TestDeepEP(TestCasePlus):
+    """DeepEP is a GPU package, so what runs on a CPU box is the guards, the registry, and the two pure-torch steps
+    that have to line up with the row order DeepEP returns."""
+
+    # `DeepEP` reads `size()` before it touches the process group, so a mesh of a size is all a guard test needs.
+    @staticmethod
+    def mesh(size=1):
+        return SimpleNamespace(size=lambda: size)
+
+    def test_it_is_registered(self):
+        self.assertIs(EPImplementationInterface()["deep_ep"], DeepEP)
+        # `"auto"` builds the all-to-all, all-reduce and Mega MoE implementations only: an installed DeepEP must
+        # never change what a user who did not ask for it runs.
+        self.assertIs(EPImplementationInterface()["auto"], AutoEP)
+
+    def test_missing_package_names_the_install(self):
+        with patch("transformers.distributed.expert_parallel.is_deep_ep_available", return_value=False):
+            with self.assertRaisesRegex(ImportError, "deep_ep"):
+                DeepEP(_DummyExperts(), self.mesh(), self.mesh())
+
+    def test_tensor_parallelism_is_refused(self):
+        with patch("transformers.distributed.expert_parallel.is_deep_ep_available", return_value=True):
+            with self.assertRaisesRegex(ValueError, "tp_size=1"):
+                DeepEP(_DummyExperts(), self.mesh(), self.mesh(2))
+
+    def test_int16_routing_limit_is_refused(self):
+        experts = _DummyExperts()
+        experts.num_experts = 20000
+        with patch("transformers.distributed.expert_parallel.is_deep_ep_available", return_value=True):
+            with self.assertRaisesRegex(ValueError, "int16"):
+                DeepEP(experts, self.mesh(2), self.mesh())
+
+    def test_a_non_bf16_batch_is_refused(self):
+        """DeepEP moves bf16 tokens: an fp32 or CPU batch gets the reason instead of a kernel error."""
+        with patch("transformers.distributed.expert_parallel.is_deep_ep_available", return_value=True):
+            experts = _DummyExperts()
+            implementation = DeepEP.__new__(DeepEP)
+            implementation.experts_forward = experts.forward
+            implementation.num_experts = experts.num_experts
+            implementation.num_local_experts = experts.num_experts
+            implementation.ep_mesh = self.mesh()
+            with self.assertRaisesRegex(ValueError, "bf16"):
+                implementation(torch.zeros(2, 4), torch.zeros(2, 1, dtype=torch.long), torch.ones(2, 1))
+
+    def test_routing_is_the_dense_probability_of_every_pair(self):
+        top_k_index = torch.tensor([[0, 3], [1, 2]])
+        top_k_weights = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
+        probs = deep_ep_routing(top_k_index, top_k_weights, num_experts=4)
+        expected = torch.tensor([[0.6, 0.0, 0.0, 0.4], [0.0, 0.7, 0.3, 0.0]])
+        torch.testing.assert_close(probs, expected)
+        # the scatter is what carries the combine's gradient back to the routing weights
+        probs.backward(torch.arange(8.0).view(2, 4))
+        torch.testing.assert_close(top_k_weights.grad, torch.tensor([[0.0, 3.0], [5.0, 6.0]]))
+
+    def test_local_ids_follow_the_grouped_rows(self):
+        # expert 0 owns rows 0-1, expert 1 owns nothing, expert 2 owns rows 2-4
+        ids = deep_ep_local_expert_ids(torch.tensor([2, 0, 3]), num_rows=5)
+        self.assertEqual(ids.flatten().tolist(), [0, 0, 2, 2, 2])
+
+
 class _DummyExperts(torch.nn.Module):
     """Toy experts: expert `i` multiplies a token by `scales[i]` (1 by default, on 2 experts). The id `num_experts`
     marks a route to another rank's expert (`AllReduceEP` masks them that way) and adds nothing."""
@@ -159,6 +227,17 @@ def _dispatch_hands_experts_the_received_rows(rank):
     mesh = init_device_mesh("cpu", (2, 1), mesh_dim_names=("ep", "tp"))
     experts = EpDispatchExpertsParallel().install_forward(_DummyExperts(), mesh["ep"], tp_mesh=mesh["tp"])
     experts(hidden_states, torch.tensor([[0, 3], [1, 2], [2, 1], [3, 0]]), torch.ones(4, 2))
+
+
+def _deep_ep_without_the_package_is_refused(rank):
+    from transformers.utils.import_utils import is_deep_ep_available
+
+    assert not is_deep_ep_available(), "this test needs an environment without DeepEP"
+    mesh = init_device_mesh("cpu", (2, 1), mesh_dim_names=("ep", "tp"))
+    with pytest.raises(ImportError, match="deep_ep"):
+        EpDispatchExpertsParallel().install_forward(
+            _DummyExperts(), mesh["ep"], tp_mesh=mesh["tp"], ep_implementation="deep_ep"
+        )
 
 
 def _install_forward_checks_ep_implementation(rank):

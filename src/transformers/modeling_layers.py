@@ -17,6 +17,8 @@ import copy
 import os
 import re
 import sys
+import types
+from collections.abc import Callable
 from functools import partial, wraps
 from typing import TYPE_CHECKING
 
@@ -52,6 +54,32 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _own_code_object(fn: Callable) -> Callable:
+    """A copy of `fn` with its own code object.
+
+    `torch.compile` keys its frame cache on the code object, so without this the per-layer bodies would share one
+    cache, re-trace per layer, and past `torch._dynamo.config.recompile_limit` fall back to eager; a checkpointed
+    layer's forward and recompute would then pick different graphs.
+    """
+    _own_code_object.serial += 1
+    code = fn.__code__
+    clone = types.FunctionType(
+        code.replace(co_name=f"{code.co_name}_{_own_code_object.serial}"),
+        fn.__globals__,
+        fn.__name__,
+        fn.__defaults__,
+        fn.__closure__,
+    )
+    clone.__kwdefaults__ = fn.__kwdefaults__
+    clone.__dict__.update(fn.__dict__)
+    clone.__module__ = fn.__module__
+    clone.__qualname__ = fn.__qualname__
+    return clone
+
+
+_own_code_object.serial = 0
+
+
 class GradientCheckpointingLayer(nn.Module):
     """Base class for layers with gradient checkpointing.
 
@@ -79,6 +107,9 @@ class GradientCheckpointingLayer(nn.Module):
     # Layers that only read the KV cache can set this to keep it under gradient checkpointing (the recompute reads the
     # same states). Writers must leave it `False`, otherwise the cache is updated a second time on the backward replay.
     _can_checkpoint_with_cache = False
+    # Set by `activation_checkpointing_enable(compile_layers=True)`: run the layer's body under `torch.compile`, with
+    # the checkpoint around it rather than inside its graph.
+    _compile_layer_body = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -118,10 +149,32 @@ class GradientCheckpointingLayer(nn.Module):
                     message = message.rstrip(",") + "."
                     logger.warning_once(message)
 
-                return self._gradient_checkpointing_func(partial(forward, self, **kwargs), *args)
+                body = partial(forward, self, **kwargs)
+                if self._compile_layer_body:
+                    # The checkpoint stays outside the compiled region: a reentrant checkpoint's backward calls the
+                    # body itself and gets the same graph, whereas a non-reentrant one is recomputed with dynamo
+                    # disabled and disagrees with the compiled forward on what it saved.
+                    compiled = self._compiled_layer_body(forward)
+
+                    def body(*tensors):
+                        return compiled(*tensors, **kwargs)
+
+                return self._gradient_checkpointing_func(body, *args)
             return forward(self, *args, **kwargs)
 
         cls.forward = forward_with_checkpointing
+
+    def _compiled_layer_body(self, forward: Callable) -> Callable:
+        """This layer's own compiled body, built once and used by both the forward and the recompute."""
+        compiled = self.__dict__.get("_compiled_body")
+        if compiled is None:
+
+            def body(*args, **kwargs):
+                return forward(self, *args, **kwargs)
+
+            compiled = torch.compile(_own_code_object(body))
+            self.__dict__["_compiled_body"] = compiled
+        return compiled
 
 
 @auto_docstring

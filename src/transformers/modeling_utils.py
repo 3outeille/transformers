@@ -3117,7 +3117,11 @@ class PreTrainedModel(
         self.tie_weights(recompute_mapping=False)
 
     def activation_checkpointing_enable(
-        self, activation_checkpointing_kwargs=None, every_n_layers: int = 1, offload: bool = False
+        self,
+        activation_checkpointing_kwargs=None,
+        every_n_layers: int = 1,
+        offload: bool = False,
+        compile_layers: bool = False,
     ):
         """
         Activates activation checkpointing for the current model.
@@ -3137,25 +3141,48 @@ class PreTrainedModel(
                 backward. Both copies run on the compute stream, so the step gets slower.
             activation_checkpointing_kwargs (dict, *optional*):
                 Additional keyword arguments passed along to the `torch.utils.checkpoint.checkpoint` function.
+            compile_layers (`bool`, *optional*, defaults to `False`):
+                Compile each checkpointed layer's body with `torch.compile`, with the checkpoint around the compiled
+                region rather than inside it, and one body per layer. This is the combination that does not work
+                otherwise: compiled inside the graph the recompute saves every intermediate, and with a non-reentrant
+                checkpoint it runs eager while the forward was compiled (`CheckpointError: Recomputed values ...
+                different metadata`).
         """
         # Subclasses and wrappers of the deprecated `gradient_checkpointing_enable` stay the entry point until v6
         if self._is_overridden("gradient_checkpointing_enable"):
+            # only passed when asked for, so an override written before this argument existed keeps working
+            extra = {"compile_layers": True} if compile_layers else {}
             self.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs=activation_checkpointing_kwargs,
                 every_n_layers=every_n_layers,
                 offload=offload,
+                **extra,
             )
         else:
-            self._activation_checkpointing_enable(activation_checkpointing_kwargs, every_n_layers, offload)
+            self._activation_checkpointing_enable(
+                activation_checkpointing_kwargs, every_n_layers, offload, compile_layers
+            )
 
     def _activation_checkpointing_enable(
-        self, activation_checkpointing_kwargs=None, every_n_layers: int = 1, offload: bool = False
+        self,
+        activation_checkpointing_kwargs=None,
+        every_n_layers: int = 1,
+        offload: bool = False,
+        compile_layers: bool = False,
     ):
         if not self.supports_gradient_checkpointing:
             raise ValueError(f"{self.__class__.__name__} does not support activation checkpointing.")
 
+        if compile_layers and (activation_checkpointing_kwargs or {}).get("use_reentrant") is False:
+            raise ValueError(
+                "`compile_layers=True` needs a reentrant checkpoint, but `use_reentrant=False` was passed: torch re-runs "
+                "a non-reentrant checkpoint with `torch.compile` disabled, so the recompute is eager while the forward "
+                "was compiled and the two disagree on the tensors they saved (`CheckpointError: Recomputed values ... "
+                "different metadata`). Drop `use_reentrant=False`, or drop `compile_layers`."
+            )
+
         if activation_checkpointing_kwargs is None:
-            activation_checkpointing_kwargs = {"use_reentrant": False}
+            activation_checkpointing_kwargs = {"use_reentrant": compile_layers}
 
         if offload:
             # `get_current_accelerator()` is None when no accelerator is available, in which case the
@@ -3186,6 +3213,13 @@ class PreTrainedModel(
                 "You are using an old version of the checkpointing format that is deprecated (We will also silently ignore `activation_checkpointing_kwargs` in case you passed it)."
                 "Please update to the new format on your modeling file. To use the new format, you need to completely remove the definition of the method `_set_gradient_checkpointing` in your model."
             )
+
+        if compile_layers:
+            from .modeling_layers import GradientCheckpointingLayer
+
+            for module in self.modules():
+                if isinstance(module, GradientCheckpointingLayer):
+                    module._compile_layer_body = compile_layers
 
         needs_embedding_grads = self.main_input_name == "input_ids"
         # we use that also to detect whether or not we have to raise if embeddings are missing (the submodel might not have embeddings at all)
@@ -3266,6 +3300,11 @@ class PreTrainedModel(
             self._activation_checkpointing_disable()
 
     def _activation_checkpointing_disable(self):
+        from .modeling_layers import GradientCheckpointingLayer
+
+        for module in self.modules():
+            if isinstance(module, GradientCheckpointingLayer):
+                module._compile_layer_body = False
         if self.supports_gradient_checkpointing:
             # For old GC format (transformers < 4.35.0) for models that live on the Hub
             # we will fall back to the overwritten `_set_gradient_checkpointing` method

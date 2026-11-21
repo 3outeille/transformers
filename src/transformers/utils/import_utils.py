@@ -798,6 +798,12 @@ def is_grouped_mm_available() -> bool:
 
 @lru_cache
 @_make_compile_constant
+def is_deep_ep_available() -> bool:
+    return _is_package_available("deep_ep")[0]
+
+
+@lru_cache
+@_make_compile_constant
 def is_kenlm_available() -> bool:
     return _is_package_available("kenlm")[0]
 
@@ -2438,6 +2444,13 @@ RICH_IMPORT_ERROR = """
 rich`. Please note that you may need to restart your runtime after installation.
 """
 
+DEEP_EP_IMPORT_ERROR = """
+DeepEP is required for `ep_implementation="deep_ep"` but it was not found in your environment. Install it with
+`pip install git+https://github.com/deepseek-ai/DeepEP.git@hybrid-ep` (it builds CUDA kernels and needs a CUDA
+toolkit, `ninja` and NVSHMEM), or use `ep_implementation="all_to_all"`.
+"""
+
+
 MISTRAL_COMMON_IMPORT_ERROR = """
 {0} requires the mistral-common library but it was not found in your environment. You can install it with pip: `pip install mistral-common`. Please note that you may need to restart your runtime after installation.
 """
@@ -2451,6 +2464,7 @@ BACKENDS_MAPPING = OrderedDict(
         ("cv2", (is_cv2_available, CV2_IMPORT_ERROR)),
         ("datasets", (is_datasets_available, DATASETS_IMPORT_ERROR)),
         ("decord", (is_decord_available, DECORD_IMPORT_ERROR)),
+        ("deep_ep", (is_deep_ep_available, DEEP_EP_IMPORT_ERROR)),
         ("detectron2", (is_detectron2_available, DETECTRON2_IMPORT_ERROR)),
         ("diffusers", (is_diffusers_available, DIFFUSERS_IMPORT_ERROR)),
         ("essentia", (is_essentia_available, ESSENTIA_IMPORT_ERROR)),

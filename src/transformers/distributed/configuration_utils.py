@@ -77,6 +77,9 @@ class DistributedConfig:
             - `"all_to_all"` exchanges the routed tokens with all-to-all collectives.
             - `"all_reduce"` runs each rank's experts on the batch the EP group shares, and sums the outputs. It
               requires `ep_size == tp_size`.
+            - `"deep_ep"` exchanges the routed tokens with DeepEP's hybrid-ep kernels, which overlap the exchange
+              with compute. It needs the `deep_ep` package (see `DEEP_EP_IMPORT_ERROR`), bf16 tokens, one NVLink
+              domain for the EP group and `tp_size == 1`.
             - `"deepgemm_megamoe"` hands that batch to DeepGEMM Mega MoE, whose kernel exchanges the tokens itself.
               Loading with `experts_implementation="deepgemm_megamoe"` selects it.
             - `"auto"` runs `"all_reduce"` at inference when the EP group shares one batch, and `"all_to_all"`

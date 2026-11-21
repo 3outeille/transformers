@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from ..utils import logging
 from ..utils.generic import GeneralInterface
-from ..utils.import_utils import is_torch_available, is_torch_distributed_available
+from ..utils.import_utils import (
+    DEEP_EP_IMPORT_ERROR,
+    is_deep_ep_available,
+    is_torch_available,
+    is_torch_distributed_available,
+)
 from .parallel_utils import ALL_PARALLEL_STYLES, _use_local_dtensor_params
 
 
@@ -259,6 +264,188 @@ class AllToAllEP(EPImplementation):
         return output.full_tensor()
 
 
+# DeepEP's buffer is a symmetric-heap allocation of `tokens x hidden` per rank, so one buffer per (group, hidden
+# size, local experts) serves every layer: a buffer per layer would be the model's memory instead of the layer's.
+_DEEP_EP_BUFFERS: dict[tuple, list] = {}
+# DeepEP routes with int16 expert ids (`num_of_experts` is an int16 argument in its kernels).
+DEEP_EP_MAX_EXPERTS = 32768
+
+
+def _deep_ep_buffer(group, hidden_dim: int, local_experts: int, tokens: int):
+    """The shared hybrid-ep buffer for this layout, grown when a larger micro-batch arrives."""
+    key = (id(group), group.size(), hidden_dim, local_experts)
+    entry = _DEEP_EP_BUFFERS.get(key)
+    if entry is None:
+        import deep_ep
+
+        buffer = deep_ep.HybridEPBuffer(
+            group=group,
+            hidden_dim=hidden_dim,
+            max_num_of_tokens_per_rank=tokens,
+            num_local_experts=local_experts,
+            use_fp8=False,
+            # DeepEP's custom all-gather re-uses a late rank's previous routing rows after a timeout; NCCL does not.
+            enable_custom_allgather=False,
+        )
+        # the group is kept with the buffer, so that its id cannot be reused by a different group
+        _DEEP_EP_BUFFERS[key] = [buffer, tokens, group]
+        return buffer
+    buffer, capacity, _group = entry
+    if tokens > capacity:
+        # DeepEP reallocates internally when a call needs more slots than the buffer was built with, which it calls
+        # extra run-time overhead: ask for the size up front instead, once per shape.
+        buffer.update_template_config(num_of_tokens_per_rank=tokens, num_local_experts=local_experts)
+        entry[1] = tokens
+    return buffer
+
+
+def deep_ep_routing(top_k_index: torch.Tensor, top_k_weights: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """The dense fp32 `[tokens, num_experts]` routing DeepEP takes, differentiable in `top_k_weights`.
+
+    DeepEP reads one probability per (token, expert) pair, and returns the gradient of the combine through the
+    same tensor; the scatter is what carries that gradient back to the router's top-k weights.
+    """
+    probs = top_k_index.new_zeros((top_k_index.size(0), num_experts), dtype=torch.float32)
+    return probs.scatter(1, top_k_index, top_k_weights.to(torch.float32))
+
+
+def deep_ep_local_expert_ids(tokens_per_expert: torch.Tensor, num_rows: int) -> torch.Tensor:
+    """The local expert id of every row DeepEP returned, as the `(rows, 1)` routing the experts take.
+
+    The dispatched rows come back grouped by local expert: expert `e` owns `tokens_per_expert[e]` consecutive
+    rows. That is exactly the order an experts implementation that groups by expert wants, so the ids are a
+    `repeat_interleave` of the expert range, not a search.
+    """
+    experts = torch.arange(tokens_per_expert.numel(), device=tokens_per_expert.device)
+    return experts.repeat_interleave(tokens_per_expert, output_size=num_rows).unsqueeze(-1)
+
+
+class _DeepEPDispatch(torch.autograd.Function):
+    """Permute + all-to-all + permute on DeepEP's kernels; the backward is the matching combine."""
+
+    @staticmethod
+    def forward(ctx, hidden, top_k_index, probs, buffer, num_experts, num_local_experts):
+        dispatched, dispatched_probs, _scaling, tokens_per_expert, handle = buffer.dispatch_with_permute(
+            hidden=hidden,
+            topk_idx=top_k_index,
+            probs=probs,
+            num_of_experts_per_rank=num_local_experts,
+            num_of_experts=num_experts,
+        )
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.num_permuted = tokens_per_expert.sum()
+        # A detached router must not pay for, or depend on, the routing weights' gradient.
+        ctx.wants_probs_grad = probs.requires_grad
+        return dispatched, dispatched_probs, tokens_per_expert, handle
+
+    @staticmethod
+    def backward(ctx, grad_dispatched, grad_probs, grad_tokens_per_expert, grad_handle):
+        grad_hidden, grad_probs_out = ctx.buffer.combine_with_unpermute(
+            hidden=grad_dispatched.contiguous(),
+            probs=grad_probs if ctx.wants_probs_grad else None,
+            handle=ctx.handle,
+        )
+        return grad_hidden, None, grad_probs_out if ctx.wants_probs_grad else None, None, None, None
+
+
+class _DeepEPCombine(torch.autograd.Function):
+    """Unpermute + all-to-all + unpermute on DeepEP's kernels; the backward is a dispatch along the handle."""
+
+    @staticmethod
+    def forward(ctx, hidden, buffer, handle, num_permuted):
+        combined, _probs = buffer.combine_with_unpermute(hidden=hidden, handle=handle)
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.num_permuted = num_permuted
+        return combined
+
+    @staticmethod
+    def backward(ctx, grad_combined):
+        (grad_dispatched,) = ctx.buffer.dispatch_with_permute(
+            hidden=grad_combined.contiguous(),
+            handle=ctx.handle,
+            num_permuted_tokens=ctx.num_permuted,
+        )[:1]
+        return grad_dispatched, None, None, None
+
+
+@torch.compiler.disable
+def _deep_ep_dispatch(hidden, top_k_index, probs, buffer, num_experts, num_local_experts):
+    """`_DeepEPDispatch.apply`, outside dynamo's graph: data-dependent shapes and a Python-object argument."""
+    return _DeepEPDispatch.apply(hidden, top_k_index, probs, buffer, num_experts, num_local_experts)
+
+
+@torch.compiler.disable
+def _deep_ep_combine(hidden, buffer, handle, num_permuted):
+    """`_DeepEPCombine.apply`, outside dynamo's graph (same reasons as `_deep_ep_dispatch`)."""
+    return _DeepEPCombine.apply(hidden, buffer, handle, num_permuted)
+
+
+class DeepEP(EPImplementation):
+    """
+    The exchange on DeepEP's hybrid-ep kernels (https://github.com/deepseek-ai/DeepEP), the experts on the rows
+    they return.
+
+    Unlike `AllToAllEP`, which all-to-all's on the compute stream and reads the split sizes back to the host every
+    layer, DeepEP keeps dedicated warps on the exchange and hands the received rows back **already grouped by local
+    expert**, with `tokens_per_expert` and one routing probability per row: the experts run their own implementation
+    unchanged on a batch that needs no sort.
+
+    The backward is DeepEP's symmetric pair (a combine for the dispatch, a dispatch for the combine), so the routing
+    weights' gradient comes back through the dense probability tensor.
+
+    It needs the `deep_ep` package, bf16 tokens on CUDA, one NVLink domain for the EP group, `tp_size == 1` and
+    int16 routing ids (`num_experts <= 32768`). Selecting it without the package raises `DEEP_EP_IMPORT_ERROR`;
+    `"auto"` never picks it.
+    """
+
+    def __init__(self, experts: nn.Module, ep_mesh: DeviceMesh, tp_mesh: DeviceMesh):
+        # Checked before the parent class touches the process group, so a caller gets the reason, not a
+        # rendezvous error.
+        if not is_deep_ep_available():
+            raise ImportError(DEEP_EP_IMPORT_ERROR)
+        if tp_mesh.size() > 1:
+            raise ValueError(
+                '`ep_implementation="deep_ep"` exchanges the batch this rank holds and needs `tp_size=1`, got '
+                f'`tp_size={tp_mesh.size()}`: use `ep_implementation="all_to_all"`, or run DeepEP with `tp_size=1`.'
+            )
+        # The experts are sharded whole per rank, so the local count times the group is the model's count.
+        num_experts = experts.num_experts * ep_mesh.size()
+        if num_experts > DEEP_EP_MAX_EXPERTS:
+            raise ValueError(
+                '`ep_implementation="deep_ep"` routes with int16 expert ids and supports at most '
+                f"{DEEP_EP_MAX_EXPERTS} experts, got {num_experts}."
+            )
+        super().__init__(experts, ep_mesh, tp_mesh)
+        self.num_experts = num_experts
+
+    def __call__(self, hidden_states, top_k_index, top_k_weights):
+        if hidden_states.device.type != "cuda" or hidden_states.dtype is not torch.bfloat16:
+            raise ValueError(
+                '`ep_implementation="deep_ep"` exchanges bf16 tokens on CUDA, got '
+                f"{hidden_states.dtype} on {hidden_states.device}: run the model in bf16, or use "
+                '`ep_implementation="all_to_all"`.'
+            )
+        tokens = hidden_states.size(0)
+        buffer = _deep_ep_buffer(self.ep_mesh.get_group(), hidden_states.size(-1), self.num_local_experts, tokens)
+        dispatched, dispatched_probs, tokens_per_expert, handle = _deep_ep_dispatch(
+            hidden_states.contiguous().to(torch.bfloat16),
+            top_k_index.to(torch.int16),
+            deep_ep_routing(top_k_index, top_k_weights, self.num_experts),
+            buffer,
+            self.num_experts,
+            self.num_local_experts,
+        )
+        # in blocking mode DeepEP copies the counts through pinned memory, so they arrive on the host
+        local_ids = deep_ep_local_expert_ids(tokens_per_expert.to(dispatched.device), dispatched.size(0))
+        expert_output = self.experts_forward(
+            dispatched, local_ids, dispatched_probs.to(dispatched.dtype).unsqueeze(-1)
+        )
+        combined = _deep_ep_combine(expert_output.contiguous(), buffer, handle, tokens_per_expert.sum())
+        return combined.to(hidden_states.dtype)
+
+
 class AllReduceEP(EPImplementation):
     """
     When the EP group shares one batch (`ep_size == tp_size`): every rank runs its own experts on the whole batch,
@@ -372,6 +559,7 @@ class EPImplementationInterface(GeneralInterface):
         "auto": AutoEP,
         "all_to_all": AllToAllEP,
         "all_reduce": AllReduceEP,
+        "deep_ep": DeepEP,
         "deepgemm_megamoe": MegaMoeEP,
     }
 

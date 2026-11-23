@@ -67,6 +67,8 @@ class DistributedMixin:
     _fsdp_size = None
     _pp_plan: dict[str, tuple[str, str]] | None = None
     _fsdp_plan: dict[str, str] | None = None
+    # The `_no_placement_params` that FSDP leaves whole, on the CPU (see `apply_fully_sharded_data_parallelism`)
+    _fsdp_no_placement_params: frozenset[str] | set[str] = frozenset()
 
     @property
     def is_distributed_loading_by_transformers(self) -> bool:

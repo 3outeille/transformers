@@ -4416,13 +4416,18 @@ class PreTrainedModel(
         # Prepare the full device map
         if device_map is not None:
             device_map = _get_device_map(model, device_map, max_memory, hf_quantizer)
+        # The parameters FSDP leaves out are loaded whole on the CPU. Only for loading: in `device_map` they would make
+        # `accelerate_dispatch` below offload them with hooks
+        load_device_map = device_map
+        if model._fsdp_no_placement_params:
+            load_device_map = device_map | dict.fromkeys(model._fsdp_no_placement_params, "cpu")
 
         # Finalize model weight initialization
         load_config = LoadStateDictConfig(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
             sharded_metadata=sharded_metadata,
-            device_map=device_map,
+            device_map=load_device_map,
             disk_offload_folder=offload_folder,
             offload_buffers=offload_buffers,
             dtype=dtype,
@@ -4437,7 +4442,7 @@ class PreTrainedModel(
         )
         if distributed_checkpoint_dir is not None:
             loading_info = model._load_and_finalize_distributed_pretrained_model(
-                distributed_checkpoint_dir, device_map, device_mesh
+                distributed_checkpoint_dir, load_device_map, device_mesh
             )
             disk_offload_index = None
         else:

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from ..utils import is_torch_available, is_torch_distributed_available, logging, strtobool
 from ..utils.quantization_config import QuantizationMethod
 from .parallel_utils import replace_layer_number_by_wildcard
-from .utils import _is_torch_distributed_initialized, _warning_once_on_rank_zero
+from .utils import _is_torch_distributed_initialized, _warning_once_on_rank_zero, is_dtensor
 
 
 if TYPE_CHECKING:
@@ -146,6 +146,21 @@ def _resolve_tied_embed_lm_head_plan(
     return adapted_plan
 
 
+def get_no_placement_params(model: nn.Module) -> dict[str, nn.Parameter]:
+    """Return the parameters that the model, or one of its sub-models, lists in `_no_placement_params`."""
+    listed_names = []
+    for module in model.modules():
+        listed_names.extend(getattr(module, "_no_placement_params", None) or [])
+
+    no_placement_params = {}
+    for name, param in model.named_parameters():
+        is_listed = any(name == listed or name.endswith(f".{listed}") for listed in listed_names)
+        already_split_by_tensor_parallelism = is_dtensor(param)
+        if is_listed and not already_split_by_tensor_parallelism:
+            no_placement_params[name] = param
+    return no_placement_params
+
+
 def verify_fsdp_plan(module_names: list[str], fsdp_plan: dict[str, str] | None) -> None:
     """
     Verify the FSDP plan of the model, log a warning if plan keys were not applied or strategies are invalid.
@@ -191,6 +206,12 @@ def apply_fully_sharded_data_parallelism(
     else:
         fsdp_mesh = mesh_manager.get_mesh("fsdp")
     fsdp_policy_kwargs = _get_fsdp_policy_kwargs(distributed_config)
+    # A model's `_no_placement_params` (a huge embedding table the forward reads a few rows of, for instance) stay out of
+    # FSDP, which would all-gather them whole on every rank: `from_pretrained` loads them on the CPU. FSDP doesn't reduce
+    # their gradients either, so they are meant to be frozen.
+    no_placement_params = get_no_placement_params(model)
+    fsdp_policy_kwargs["ignored_params"] = set(no_placement_params.values())
+    model._fsdp_no_placement_params = set(no_placement_params)
 
     if distributed_config is not None and distributed_config.ep_size > 1:
         if distributed_config.dp_replicate_size > 1:

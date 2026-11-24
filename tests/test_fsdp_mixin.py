@@ -55,13 +55,14 @@ logger = logging.getLogger("transformers.training_test")
 if is_torch_available():
     import torch
     import torch.distributed as dist
-    from torch.distributed.tensor import Replicate, Shard
+    from torch.distributed.tensor import DTensor, Replicate, Shard
     from torch.nn.parallel import DistributedDataParallel as DDP
 
     from transformers.distributed import DistributedConfig
     from transformers.distributed.checkpoint import load_optimizer_distributed, save_optimizer_distributed
     from transformers.distributed.fsdp import _resolve_tied_embed_lm_head_plan, is_fsdp_managed_module
     from transformers.distributed.utils import gather_full_state_dict
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 
 
 # =============================================================================
@@ -362,6 +363,40 @@ def _test_fsdp2_save_load_impl(rank, config_class, config_dict, dp_replicate_siz
 
         if rank == 0:
             logger.debug(f"FSDP2 save/load test passed: all {len(state_dict_before)} parameters match exactly.")
+
+
+def _test_fsdp2_no_placement_params_impl(rank, config_class, config_dict):
+    """A parameter the model declares in `_no_placement_params` stays out of FSDP: whole and on the CPU on every rank."""
+    init_test_logger()
+
+    config = config_class.from_dict(config_dict)
+    config.tie_word_embeddings = False
+    model_class = MODEL_FOR_CAUSAL_LM_MAPPING[config_class]
+    no_placement_class = type(
+        f"NoPlacement{model_class.__name__}", (model_class,), {"_no_placement_params": ["embed_tokens.weight"]}
+    )
+    distributed_config = DistributedConfig(fsdp_size=dist.get_world_size())
+
+    with _deterministic_init_model_dir(rank, config, torch.float32) as init_dir:
+        checkpoint = model_class.from_pretrained(init_dir).state_dict()
+        model = no_placement_class.from_pretrained(init_dir, distributed_config=distributed_config)
+        dist.barrier()
+
+        assert len(model._fsdp_no_placement_params) == 1, model._fsdp_no_placement_params
+        for name, param in model.named_parameters():
+            if name in model._fsdp_no_placement_params:
+                assert not isinstance(param, DTensor) and param.device.type == "cpu", (name, type(param), param.device)
+                torch.testing.assert_close(param, checkpoint[name], rtol=0, atol=0)
+            else:
+                assert isinstance(param, DTensor), f"{name} is not sharded by FSDP"
+
+        with _distributed_tmpdir(rank) as tmpdir:
+            model.save_pretrained(tmpdir, is_main_process=(rank == 0))
+            dist.barrier()
+            saved = model_class.from_pretrained(tmpdir).state_dict()
+            dist.barrier()
+        for name, value in checkpoint.items():
+            torch.testing.assert_close(saved[name], value, rtol=0, atol=0, msg=f"save_pretrained changed {name}")
 
 
 def _test_fsdp2_bf16_training_impl(rank, config_class, config_dict):
@@ -892,6 +927,11 @@ class FSDPTesterMixin(ABC):
     @is_fsdp_test
     def test_fsdp2_bf16_training(self):
         self._run_fsdp2_distributed_test("test_fsdp2_bf16_training", _test_fsdp2_bf16_training_impl)
+
+    @require_torch_greater_or_equal("2.7")
+    @is_fsdp_test
+    def test_fsdp2_no_placement_params(self):
+        self._run_fsdp2_distributed_test("test_fsdp2_no_placement_params", _test_fsdp2_no_placement_params_impl)
 
     @require_torch_greater_or_equal("2.7")
     @is_fsdp_test
